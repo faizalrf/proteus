@@ -1,0 +1,201 @@
+---
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ Scylla Cloud Management Configuration                                       ┃
+# ┃ Public-facing API for provisioning and managing Scylla Cloud clusters       ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+# Global Settings
+api:
+  token: "${SCYLLA_CLOUD_API_TOKEN}"             # Scylla Cloud API token (can use env var)
+  timeout: 300                                   # API request timeout in seconds
+  ssl_verify: true                               # Verify SSL certificates
+  ssh_key_public: "~/.ssh/id_ed25519.pub"       # Global public SSH key path
+  ssh_key_private: "~/.ssh/id_ed25519"          # Global private SSH key path
+
+# Reference Data (friendly values -> Scylla Cloud IDs)
+reference_data:
+  cloud_data_path: "./cloud-data.json"           # Maps provider/region/instance names to IDs used by API
+  api_error_codes_path: "./api_error_codes.tsv"  # Error code catalog for decoding API failures
+  auto_refresh: false                             # If true, refresh from API before each run
+
+# Cluster Definitions
+clusters:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Example 1: New X-Cloud cluster on AWS
+  # ─────────────────────────────────────────────────────────────────────────────
+  prod-xc-aws:
+    cluster_name: "prod-xc-aws"                  # Cluster display name (max 63 chars, lowercase, hyphens ok)
+    description: "Production X-Cloud cluster on AWS"
+    cluster_type: "x-cloud"                      # x-cloud | scylla-cloud
+    
+    # Link to existing cluster (optional) — if set, skip creation and attach to existing cluster
+    existing_cluster_id: null                    # Set to cluster-id to manage existing cluster
+    
+    # Cloud & Availability
+    cloud: "aws"                                 # aws | gcp
+    region: "us-west-2"                          # Primary region
+    # Optional explicit IDs (if set, overrides lookup from cloud-data.json)
+    resolved_ids:
+      cloud_provider_id: null                     # Example AWS=1, GCP=2 (depends on account/API)
+      region_id: null                             # Region ID in Scylla Cloud API
+    
+    # Cluster Configuration
+    scylla_version: "2026.1.1"                   # Must be available in Scylla Cloud API
+    api_interface: "CQL"                         # CQL (default) | ALTERNATOR (DynamoDB API)
+    replication_factor: 3                        # RF for created tables
+    
+    # Network
+    broadcast_type: "PRIVATE"                    # PRIVATE (VPC peering) | PUBLIC
+    cidr_block: "172.31.0.0/24"                  # Cluster VPC CIDR (must not overlap with loader/existing VPCs)
+    
+    # Infrastructure Scaling (X-Cloud auto-scaling policy)
+    scaling:
+      instance_families:                         # Instance families allowed for auto-scaling
+        - "i8g"
+      instance_types: []                         # Optional: restrict to specific types (empty = any in family)
+        # - "i8g.4xlarge"
+        # - "i8g.8xlarge"
+      instance_type_ids: []                      # Optional explicit API instanceTypeIDs (overrides name-based lookup)
+      storage:
+        min_gb: 1024                             # Minimum storage before scale-down (0 = no floor)
+        target_utilization: 80                   # Scale up when utilization reaches %
+      vcpu:
+        min: 12                                  # Minimum vCPU count for scale-down threshold
+    
+    # Optional: Enable vector search nodes
+    vector_search:
+      enabled: false                             # Set to true to deploy vector search
+      count: 2                                   # Number of vector search nodes
+      instance_type: "r7g.large"                 # Must be available in region
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Example 2: New standard Scylla Cloud cluster on GCP
+  # ─────────────────────────────────────────────────────────────────────────────
+  prod-sc-gcp:
+    cluster_name: "prod-sc-gcp"
+    description: "Standard Scylla Cloud cluster on GCP"
+    cluster_type: "scylla-cloud"                 # Standard Scylla Cloud
+    
+    existing_cluster_id: null
+    
+    cloud: "gcp"
+    region: "us-central1"
+    resolved_ids:
+      cloud_provider_id: null
+      region_id: null
+    scylla_version: "2026.1.1"
+    api_interface: "ALTERNATOR"                  # Can use ALTERNATOR for DynamoDB API
+    replication_factor: 3
+    
+    broadcast_type: "PRIVATE"
+    cidr_block: "172.31.1.0/24"
+    
+    # GCP-specific
+    gcp_project_id: "my-gcp-project"             # GCP project where cluster is deployed
+    
+    # Node configuration for scylla-cloud (fixed node groups)
+    node_groups:
+      - name: "primary"
+        node_type: "n2-highmem-8"                # GCP machine type
+        node_type_id: null                        # Optional explicit Scylla Cloud instanceId
+        count: 3                                 # Node count in group
+    
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Example 3: Existing X-Cloud cluster (management only)
+  # ─────────────────────────────────────────────────────────────────────────────
+  existing-xc:
+    cluster_name: "existing-xc"
+    description: "Manage an existing X-Cloud cluster"
+    cluster_type: "x-cloud"
+    
+    # Link to existing — this tells the API to manage, not create
+    existing_cluster_id: "xxxxx-xxxxx-xxxxx"    # REQUIRED to manage without creating
+    
+    cloud: "aws"
+    region: "us-east-1"
+    resolved_ids:
+      cloud_provider_id: null
+      region_id: null
+    
+    # For resize operations, update scaling policy
+    scaling:
+      instance_families:
+        - "i4i"
+        - "i8g"
+      storage:
+        min_gb: 512
+        target_utilization: 75
+      vcpu:
+        min: 8
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Example 4: Existing standard Scylla Cloud (resize node groups)
+  # ─────────────────────────────────────────────────────────────────────────────
+  existing-sc:
+    cluster_name: "existing-sc"
+    description: "Resize an existing Scylla Cloud cluster"
+    cluster_type: "scylla-cloud"
+    
+    existing_cluster_id: "yyyyy-yyyyy-yyyyy"
+    
+    cloud: "aws"
+    region: "us-west-2"
+    resolved_ids:
+      cloud_provider_id: null
+      region_id: null
+    
+    # Update node groups (resize existing or add new)
+    node_groups:
+      - name: "primary"
+        node_type: "i8g.4xlarge"                 # Change instance type
+        count: 5                                 # Scale from 3 to 5
+      - name: "secondary"                        # New node group
+        node_type: "i4i.xlarge"
+        count: 2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lifecycle Operations Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+operations:
+  # Timeouts for various operations
+  create_timeout_seconds: 3600                   # Max time to wait for cluster creation
+  resize_timeout_seconds: 1800                   # Max time to wait for resize to complete
+  delete_timeout_seconds: 900                    # Max time to wait for deletion
+  
+  # Polling interval while waiting for operations to complete
+  poll_interval_seconds: 30
+  
+  # Auto-tagging
+  tags:
+    environment: "production"                    # Add tags to created resources
+    managed_by: "scylla-cloud-api"
+    # project: "my-project"                      # Optional custom tags
+
+  # API error handling helpers
+  error_handling:
+    decode_with_catalog: true                    # Translate API codes (e.g. 040703) using api_error_codes.tsv
+    fail_on_unknown_code: false                  # If true, unknown codes are treated as hard failures
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Advanced Settings (Optional)
+# ─────────────────────────────────────────────────────────────────────────────
+
+advanced:
+  # Backup/snapshot settings
+  backup:
+    enabled: true                                # Enable automated backups
+    retention_days: 7                            # Backup retention period
+  
+  # Multi-region settings (future support)
+  multi_region:
+    enabled: false
+    # regions:
+    #   - us-east-1
+    #   - eu-west-1
+  
+  # Monitoring & alerting hooks
+  webhooks:
+    enabled: false
+    # on_cluster_ready: "https://example.com/webhook/ready"
+    # on_resize_complete: "https://example.com/webhook/resize"
