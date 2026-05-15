@@ -486,7 +486,9 @@ ptx cloud-data --cloud aws --region us-west-2   # inspect local map
 
 ```
 proteus/
-├── src/scm/
+├── src/ptx/
+│   ├── __init__.py
+│   ├── __main__.py     # `python -m ptx` entrypoint
 │   ├── api.py          # Scylla Cloud REST API client
 │   ├── cli.py          # All subcommands and rendering logic
 │   ├── config.py       # YAML config loading and path resolution
@@ -495,6 +497,8 @@ proteus/
 ├── config.example.yml  # Annotated config template
 ├── cloud-data.json     # Provider/region/instance ID cache
 ├── api_error_codes.tsv # Error code → description map
+├── CONFIGURATION.md    # Config field reference
+├── DESIGN.md           # Architecture notes
 ├── pyproject.toml
 └── install.sh
 ```
