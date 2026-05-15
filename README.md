@@ -17,7 +17,7 @@ ptx destroy x1 --yes
 
 - **YAML-Declarative Config** — Define clusters once; run from anywhere
 - **Multi-Cloud** — AWS and GCP via a unified interface
-- **Cluster Lifecycle** — Create, resize, update, destroy
+- **Cluster Lifecycle** — Create, resize, update, destroy (auto-clears `existing_cluster_id` on destroy)
 - **Attach Existing Clusters** — Manage clusters created outside Proteus via `existing_cluster_id`
 - **X-Cloud Auto-Scaling** — Configure storage utilization and vCPU floor policies
 - **Scylla Cloud Node Groups** — Resize named node groups independently
@@ -288,6 +288,8 @@ ptx status x1      # Single cluster with full node detail
 ### `ptx destroy <cluster-id> --yes`
 
 Delete a cluster. `--yes` is required to confirm the destructive action.
+
+After a successful delete API call, Proteus clears `existing_cluster_id` in `config.yml` (sets it to `null`) so the entry is ready for a fresh `ptx setup`. Cleared even with `--no-wait`. Skipped on `--dry-run` or declined confirmation.
 
 ```bash
 ptx destroy x1 --yes

@@ -1260,7 +1260,7 @@ def _confirm(prompt: str) -> bool:
 def cmd_destroy(args: argparse.Namespace) -> None:
     config_path = resolve_config_path(args.config, allow_missing=True)
     conf = load_config(config_path)
-    _, cluster = _cluster_from_sources(conf, args)
+    cluster_ref, cluster = _cluster_from_sources(conf, args)
 
     # Prompt for confirmation if --yes not provided
     if not args.yes and not args.dry_run:
@@ -1296,6 +1296,13 @@ def cmd_destroy(args: argparse.Namespace) -> None:
     if args.wait and request_id is not None:
         final = _wait_for_request(api, account_id, request_id, args.wait_timeout, args.poll_interval)
         _print_json("Final request status:", final)
+
+    if config_path is not None and cluster_ref in (conf.get("clusters") or {}):
+        try:
+            write_back_cluster_field(config_path, cluster_ref, "existing_cluster_id", None)
+            print(f"✓ Cleared existing_cluster_id for '{cluster_ref}' in config")
+        except Exception as e:
+            print(f"Warning: Could not clear existing_cluster_id: {e}")
 
 
 def _render_unified_status_table(clusters: list[dict[str, Any]]) -> None:
