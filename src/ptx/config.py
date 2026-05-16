@@ -103,3 +103,12 @@ def write_back_cluster_field(config_path: Path, cluster_id: str, key: str, value
     cluster = clusters.setdefault(cluster_id, {})
     cluster[key] = value
     config_path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+
+def write_back_cluster_fields(config_path: Path, cluster_id: str, fields: dict[str, Any]) -> None:
+    """Write multiple cluster fields in a single YAML round-trip."""
+    data = load_config(config_path)
+    clusters = data.setdefault("clusters", {})
+    cluster = clusters.setdefault(cluster_id, {})
+    cluster.update(fields)
+    config_path.write_text(yaml.safe_dump(data, sort_keys=False))

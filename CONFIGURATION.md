@@ -1,6 +1,6 @@
 # Configuration Guide
 
-Reference for Proteus's `config.yml`. The CLI is `ptx`; see [README.md](README.md) for command usage.
+Reference for Proteus's `config.yml`. The CLI is `px`; see [README.md](README.md) for command usage.
 
 ---
 
@@ -14,8 +14,9 @@ Reference for Proteus's `config.yml`. The CLI is `ptx`; see [README.md](README.m
 6. [X-Cloud Clusters](#x-cloud-clusters)
 7. [Scylla Cloud Clusters](#scylla-cloud-clusters)
 8. [Vector Search](#vector-search)
-9. [API Error Catalog](#api-error-catalog)
-10. [Examples](#examples)
+9. [Local Request Cache](#local-request-cache)
+10. [API Error Catalog](#api-error-catalog)
+11. [Examples](#examples)
 
 ---
 
@@ -64,6 +65,10 @@ clusters:
 | `ssl_verify` | bool | No | `true` | Disable with `--no-ssl-verify` for dev/self-signed. |
 | `ssh_key_public` | string | Yes | — | Path to public SSH key sent to the cluster. `~` expands. |
 | `ssh_key_private` | string | Yes | — | Path used for direct node access. `~` expands. |
+| `allow_create` | bool | No | `false` | Permit `px setup` to create new clusters. Set `true` to enable provisioning. Attaching via `existing_cluster_id` always works regardless of this flag. |
+| `allow_destroy` | bool | No | `false` | Permit `px destroy` globally. Can be overridden per-cluster (see below). |
+
+> **Per-cluster `allow_destroy` override:** Add `allow_destroy: true` (or `false`) directly under a cluster entry to override the global `api.allow_destroy` for that cluster only. This lets you protect most clusters while allowing teardown of specific ones.
 
 ```yaml
 api:
@@ -72,7 +77,8 @@ api:
   ssl_verify: true
   ssh_key_public: ~/.ssh/id_ed25519.pub
   ssh_key_private: ~/.ssh/id_ed25519
-```
+  allow_create: false   # set true to enable cluster creation
+  allow_destroy: false  # set true (or override per-cluster) to enable destroy
 
 ---
 
@@ -108,13 +114,13 @@ api:
 2. Friendly-name lookup in `cloud-data.json` using `cloud`, `region`, `node_type` / instance family.
 3. If unresolved, validation fails before any API call.
 
-Inspect mappings: `ptx cloud-data --cloud aws --region us-west-2`. Refresh: `ptx cache-refresh-cloud`.
+Inspect mappings: `px cloud-data --cloud aws --region us-west-2`. Refresh: `px cache-refresh-cloud`.
 
 ---
 
 ## Cluster Definition — Common Fields
 
-Each entry under `clusters:` is keyed by a cluster ID (used positionally on the CLI, e.g. `ptx setup x1`).
+Each entry under `clusters:` is keyed by a cluster ID (used positionally on the CLI, e.g. `px setup x1`).
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -193,7 +199,7 @@ node_groups:
     count: 3
 ```
 
-Resize via `ptx resize sc1 --node-count 5` or by editing `count` in config and running `ptx resize sc1`. `--node-type` changes instance type.
+Resize via `px resize sc1 --node-count 5` or by editing `count` in config and running `px resize sc1`. `--node-type` changes instance type.
 
 ---
 
@@ -213,6 +219,41 @@ vector_search:
   count: 2
   instance_type: r7g.large
 ```
+
+---
+
+## Local Request Cache
+
+Proteus writes `.px_requests.json` alongside `config.yml` whenever an async request is submitted (`setup`, `resize`, `destroy`). This file is the only persistent state Proteus maintains beyond the config file.
+
+### Purpose
+
+- **Accurate elapsed timing** in `px progress` — the API does not return an `UpdatedAt` field, so Proteus tracks `submitted_at` locally and stamps `completed_at` on first COMPLETED observation.
+- **Request identity** — helps `px progress` find the correct in-flight request when the API's request list contains stale entries.
+- **Session resumption** — closing the terminal mid-operation is safe; re-run `px progress <cluster> --follow` to reattach.
+
+### Format
+
+```json
+{
+  "_version": 1,
+  "requests": {
+    "<request_id>": {
+      "submitted_at": "<ISO 8601 UTC>",
+      "cluster_ref": "<cluster key from config>",
+      "cluster_id": 49505,
+      "operation": "resize | destroy | setup | RESIZE_CLUSTER_V3 | ...",
+      "completed_at": "<ISO 8601 UTC>"   // stamped on first COMPLETED observation
+    }
+  }
+}
+```
+
+### Maintenance
+
+- Entries older than **7 days** are pruned automatically on every write.
+- The file is safe to delete; Proteus recreates it on the next operation. Elapsed timing for any pending request will fall back to `now − API createdAt`.
+- The file is not version-controlled by default (add `.px_requests.json` to `.gitignore`).
 
 ---
 
@@ -257,8 +298,8 @@ clusters:
 ```
 
 ```bash
-ptx setup x1 --dry-run
-ptx setup x1
+px setup x1 --dry-run
+px setup x1
 ```
 
 ### 2. Scylla Cloud on GCP with multiple node groups
@@ -299,8 +340,8 @@ clusters:
 ```
 
 ```bash
-ptx status legacy
-ptx resize legacy
+px status legacy
+px resize legacy
 ```
 
 ---
@@ -308,8 +349,8 @@ ptx resize legacy
 ## Validation
 
 ```bash
-ptx validate            # all clusters
-ptx validate x1 sc1     # specific clusters
+px validate            # all clusters
+px validate x1 sc1     # specific clusters
 ```
 
 Checks: required fields present, friendly names resolve via `cloud-data.json`, IDs available for API submission. Validate runs offline — no live API calls.

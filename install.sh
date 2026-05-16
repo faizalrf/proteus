@@ -24,21 +24,21 @@ else
 fi
 
 zshrc="$HOME/.zshrc"
-alias_line="alias ptx=\"$venv_dir/bin/ptx\""
+alias_line="alias px=\"$venv_dir/bin/px\""
 
 if [ -f "$zshrc" ]; then
     if ! grep -Fqx "$alias_line" "$zshrc"; then
-        echo "[proteus] Adding ptx alias to $zshrc"
+        echo "[proteus] Adding px alias to $zshrc"
         printf '\n# Added by proteus install.sh\n%s\n' "$alias_line" >> "$zshrc"
     else
-        echo "[proteus] ptx alias already present in $zshrc"
+        echo "[proteus] px alias already present in $zshrc"
     fi
 else
-    echo "[proteus] Creating $zshrc with ptx alias"
+    echo "[proteus] Creating $zshrc with px alias"
     printf '# Added by proteus install.sh\n%s\n' "$alias_line" > "$zshrc"
 fi
 
-# Link config to ~/.config/proteus/ so ptx works from any directory
+# Link config to ~/.config/proteus/ so px works from any directory
 config_dir="$HOME/.config/proteus"
 config_link="$config_dir/config.yml"
 config_src="$dir/config.yml"
@@ -53,5 +53,5 @@ fi
 
 echo "[proteus] Installation complete."
 echo "[proteus] To run the CLI, use:"
-echo "    $venv_dir/bin/ptx ..."
-echo "Or restart your shell and use: ptx ..."
+echo "    $venv_dir/bin/px ..."
+echo "Or restart your shell and use: px ..."

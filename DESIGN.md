@@ -2,7 +2,7 @@
 
 ## Overview
 
-**Proteus** is a SAF-style CLI (`ptx`) for managing Scylla Cloud and X-Cloud clusters via the Scylla Cloud REST API. Single-binary Python, YAML-declarative, no local state.
+**Proteus** is a SAF-style CLI (`px`) for managing Scylla Cloud and X-Cloud clusters via the Scylla Cloud REST API. Single-binary Python, YAML-declarative, minimal local state.
 
 ### Design Principles
 
@@ -10,8 +10,7 @@
 2. **Declarative** — Cluster shape lives in `config.yml`. CLI flags override per invocation.
 3. **Focused** — Provisioning, resizing, deletion, status. No stress testing, no scylla.yaml tuning, no loaders.
 4. **Cloud-native** — Direct REST against `api.cloud.scylladb.com`. AWS + GCP.
-5. **Existing-cluster support** — `existing_cluster_id` attaches to clusters created elsewhere.
-6. **Stateless** — Source of truth is Scylla Cloud. Every command re-queries the API.
+5. **Existing-cluster support** — `existing_cluster_id` attaches to clusters created elsewhere.7. **Request tracking** — Local cache (`.px_requests.json`) enables accurate elapsed display and progress resumption across sessions.6. **Stateless** — Source of truth is Scylla Cloud. Every command re-queries the API.
 
 ---
 
@@ -103,7 +102,36 @@ Proteus stores **no local state**. Each command:
 3. Queries the API for current cluster state.
 4. Diffs against desired config (resize) or executes the requested action.
 
-The only mutation Proteus performs on the config file is writing back `existing_cluster_id` after a successful `setup` create.
+The only mutation Proteus performs on the config file is writing back `existing_cluster_id` after a successful `setup` create, and clearing it to `null` after `destroy`.
+
+### Local Request Cache
+
+`.px_requests.json` is written alongside the config file whenever Proteus submits an async request (`setup`, `resize`, `destroy`). It is the only other persistent state Proteus maintains.
+
+```json
+{
+  "_version": 1,
+  "requests": {
+    "242571": {
+      "submitted_at": "2026-05-16T10:32:57.123456+00:00",
+      "cluster_ref": "x1",
+      "cluster_id": 49505,
+      "operation": "resize"
+    },
+    "242572": {
+      "submitted_at": "2026-05-16T10:32:57.124456+00:00",
+      "cluster_ref": "x1",
+      "cluster_id": 49505,
+      "operation": "RESIZE_CLUSTER_V3",
+      "completed_at": "2026-05-16T10:51:17.654321+00:00"
+    }
+  }
+}
+```
+
+- Entries older than 7 days are pruned on next write.
+- `completed_at` is stamped locally on first COMPLETED observation (the API does not return an `UpdatedAt` field).
+- Used by `px progress` to compute accurate elapsed times independent of API clock quirks.
 
 ### Resize as a Two-Phase Operation (X-Cloud)
 
@@ -140,7 +168,7 @@ Schema (current):
 }
 ```
 
-Refresh from the API with `ptx cache-refresh-cloud`. Inspect with `ptx cloud-data --cloud <p> --region <r>`.
+Refresh from the API with `px cache-refresh-cloud`. Inspect with `px cloud-data --cloud <p> --region <r>`.
 
 ### `api_error_codes.tsv`
 
@@ -155,10 +183,12 @@ Tab-separated `code\tdescription` rows. On `APIError`, Proteus extracts the code
 | Command | Purpose |
 |---------|---------|
 | `setup <id>`            | Create new or attach to existing cluster (writes back `existing_cluster_id`) |
+| `sync <id>`             | Auto-populate config from live cluster data; only `existing_cluster_id` required |
 | `resize <id>`           | Update X-Cloud scaling policy or Scylla Cloud node groups |
-| `destroy <id> --yes`    | Delete cluster (`--yes` required) |
-| `status [id]`           | Live cluster status table (all configured or single) |
-| `list`                  | All clusters in the account (live from API) |
+| `destroy <id>`          | Delete cluster; detaches immediately, clears `existing_cluster_id` |
+| `progress <id>`         | Show or follow active/recent request progress for a cluster |
+| `status [id]`           | Live cluster status table (all configured) or detailed node view (single) |
+| `list`                  | Account-wide cluster table with status, cloud/region, nodes, created date |
 | `validate [ids...]`     | Validate config + mapping resolution offline |
 | `cache-refresh-cloud`   | Refresh `cloud-data.json` |
 | `cloud-data`            | Inspect mapped data for a region |
@@ -166,8 +196,9 @@ Tab-separated `code\tdescription` rows. On `APIError`, Proteus extracts the code
 ### Cross-Command Flags
 
 - `--dry-run` — Print payload, no API call (setup, resize, destroy).
-- `--wait` / `--no-wait` — Block until async request completes (default: wait).
+- `--wait` / `--no-wait` — Block until async request completes (setup, resize; **not** destroy — destroy always detaches).
 - `--wait-timeout <s>` / `--poll-interval <s>` — Polling tuning.
+- `--follow` / `-f` — Tail a request live (`progress` command only).
 - Cluster override flags (`--cluster-type`, `--cloud`, `--region`, `--cidr-block`, `--vcpu-min`, etc.) let callers run without (or in addition to) config.
 
 ### Status Symbols
@@ -183,8 +214,11 @@ Tab-separated `code\tdescription` rows. On `APIError`, Proteus extracts the code
 
 ## Safety
 
+- **`allow_create` guard** — `setup` will not create a new cluster unless `allow_create: true` is set under `api:` in config. Attaching via `existing_cluster_id` is always permitted.
+- **`allow_destroy` guard** — `destroy` will not run unless `allow_destroy: true` is set under `api:` (global default) or directly on the cluster entry (per-cluster override). Defaults to `false`.
+- **Destroy triple confirmation** — Even with `allow_destroy: true`, the user must type `yes` and then type the cluster name before the API call is made (`--yes` bypasses the yes/no prompt but the name-typing prompt always runs).
+- **Detach-by-default destroy** — `destroy` returns immediately after submission; it never blocks the shell waiting for deletion. Use `px progress` to follow.
 - **In-progress guard** — Before mutating, Proteus checks for an outstanding request on the target cluster and aborts rather than stacking.
-- **Destroy confirmation** — `destroy` requires `--yes`.
 - **Dry-run** — `--dry-run` short-circuits before any state-changing API call.
 - **TLS** — Verified by default. `--no-ssl-verify` available for dev environments.
 

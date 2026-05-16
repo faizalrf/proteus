@@ -7,12 +7,12 @@ import sys
 import textwrap
 import time
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .api import APIError, ScyllaCloudAPI
-from .config import ConfigError, get_cluster, load_config, resolve_config_path, write_back_cluster_field
+from .config import ConfigError, get_cluster, load_config, resolve_config_path, write_back_cluster_field, write_back_cluster_fields
 from .errors import decode_api_error, load_error_catalog
 from .mapping import (
     MappingError,
@@ -325,28 +325,163 @@ def _extract_cluster_id_from_payload(payload: Any) -> int | None:
     return None
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    return f"{m}m{s:02d}s"
+
+
+def _parse_ts(data: dict[str, Any], *keys: str) -> datetime | None:
+    """Parse the first found ISO 8601 timestamp from data by trying each key in order."""
+    for key in keys:
+        raw = data.get(key)
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _request_elapsed_offset(data: dict[str, Any]) -> float:
+    """Return how many seconds the request has already been running, using only server
+    timestamps so local clock skew cannot affect the result.
+
+    Strategy:
+      1. Prefer updatedAt - createdAt  (both server-side, skew-proof).
+      2. Fall back to now - createdAt  (NTP skew is negligible in practice).
+      3. Return 0.0 if no usable timestamps found.
+    """
+    created = _parse_ts(data,
+        "createdAt", "created_at", "CreatedAt",
+        "submittedAt", "submitted_at", "SubmittedAt",
+        "requestTime", "RequestTime",
+    )
+    updated = _parse_ts(data,
+        "updatedAt", "updated_at", "UpdatedAt",
+        "lastUpdatedAt", "last_updated_at", "LastUpdatedAt",
+        "modifiedAt", "modified_at", "ModifiedAt",
+    )
+    if created is not None and updated is not None:
+        delta = (updated - created).total_seconds()
+        if delta > 0:
+            return delta
+    if created is not None:
+        delta = (datetime.now(timezone.utc) - created).total_seconds()
+        return max(0.0, delta)
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Request cache — persists submitted_at timestamps for --nowait operations
+# so `ptx progress` can show accurate elapsed time from submission
+# ---------------------------------------------------------------------------
+
+_REQUEST_CACHE_TTL_DAYS = 7
+
+
+def _request_cache_path(config_path: Path | None) -> Path:
+    if config_path is not None:
+        return config_path.parent / ".px_requests.json"
+    return Path.home() / ".config" / "proteus" / ".px_requests.json"
+
+
+def _load_request_cache(cache_path: Path) -> dict[str, Any]:
+    if not cache_path.exists():
+        return {"_version": 1, "requests": {}}
+    try:
+        data = json.loads(cache_path.read_text())
+        if not isinstance(data, dict) or not isinstance(data.get("requests"), dict):
+            return {"_version": 1, "requests": {}}
+        return data
+    except Exception:
+        return {"_version": 1, "requests": {}}
+
+
+def _save_request_cache(cache_path: Path, data: dict[str, Any]) -> None:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_REQUEST_CACHE_TTL_DAYS)
+    pruned = {}
+    for rid, entry in (data.get("requests") or {}).items():
+        try:
+            ts = datetime.fromisoformat(str(entry.get("submitted_at", "")).replace("Z", "+00:00"))
+            if ts >= cutoff:
+                pruned[rid] = entry
+        except Exception:
+            pass  # drop malformed entries
+    data["requests"] = pruned
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass  # best-effort; never crash on cache write
+
+
+def _record_request(
+    config_path: Path | None,
+    request_id: int,
+    cluster_ref: str,
+    cluster_id: int | None,
+    operation: str,
+    submitted_at: datetime | None = None,
+) -> None:
+    cache_path = _request_cache_path(config_path)
+    data = _load_request_cache(cache_path)
+    data["requests"][str(request_id)] = {
+        "submitted_at": (submitted_at or datetime.now(timezone.utc)).isoformat(),
+        "cluster_ref": cluster_ref,
+        "cluster_id": cluster_id,
+        "operation": operation,
+    }
+    _save_request_cache(cache_path, data)
+
+
+def _record_request_completed(config_path: Path | None, request_id: int) -> None:
+    """Stamp completed_at on a cache entry the first time completion is observed."""
+    cache_path = _request_cache_path(config_path)
+    data = _load_request_cache(cache_path)
+    entry = (data.get("requests") or {}).get(str(request_id))
+    if entry is not None and "completed_at" not in entry:
+        entry["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _save_request_cache(cache_path, data)
+
+
+def _get_cached_submitted_at(config_path: Path | None, request_id: int) -> datetime | None:
+    cache_path = _request_cache_path(config_path)
+    entry = (_load_request_cache(cache_path).get("requests") or {}).get(str(request_id))
+    if not entry:
+        return None
+    try:
+        return datetime.fromisoformat(str(entry["submitted_at"]).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 def _wait_for_request(
     api: ScyllaCloudAPI,
     account_id: int,
     request_id: int,
     timeout_seconds: int,
     poll_interval_seconds: int,
+    elapsed_offset: float = 0.0,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout_seconds
+    start = time.monotonic() - elapsed_offset
+    deadline = start + timeout_seconds
+    last_desc = ""
     while True:
         resp = api.get_cluster_request(account_id, request_id)
         data = resp.get("data") or {}
         status = str(data.get("status") or data.get("Status") or "UNKNOWN").upper()
-        pct = data.get("progressPercent") if data.get("progressPercent") is not None else data.get("ProgressPercent")
-        msg = data.get("progressDescription") or data.get("ProgressDescription") or ""
+        pct = data.get("progressPercent") if data.get("progressPercent") is not None else data.get("ProgressPercent", 0)
+        desc = data.get("progressDescription") or data.get("ProgressDescription") or ""
 
-        parts = [f"Request {request_id}", f"status={status}"]
-        if msg:
-            parts.append(msg)
-        if pct is not None:
-            parts.append(f"{pct}%")
-
-        print(" ".join(parts))
+        elapsed = _fmt_elapsed(time.monotonic() - start)
+        line = f"  [{elapsed}] [{status}] {pct}%" + (f" — {desc}" if desc != last_desc else "")
+        print(line, flush=True)
+        last_desc = desc
 
         if status in ("COMPLETED", "DONE", "SUCCEEDED"):
             return resp
@@ -367,8 +502,9 @@ def _wait_for_scale_request(
     trigger_timeout: int = 120,
 ) -> None:
     """Phase 2: wait for Scylla Cloud to start a RESIZE_CLUSTER_* request and poll it to completion."""
+    poll_start = time.monotonic()
     print("Waiting for Scylla Cloud to start scaling...")
-    deadline = time.monotonic() + trigger_timeout
+    deadline = poll_start + trigger_timeout
     scale_request_id: int | None = None
 
     while time.monotonic() < deadline:
@@ -391,8 +527,8 @@ def _wait_for_scale_request(
             print(f"Resize operation detected [{req_type}] (request {scale_request_id})")
             break
 
-        elapsed = int(deadline - time.monotonic())
-        print(f"  Waiting for scale trigger... ({trigger_timeout - elapsed}s elapsed)")
+        elapsed_s = time.monotonic() - poll_start
+        print(f"  [{_fmt_elapsed(elapsed_s)}] Waiting for scale trigger...")
 
     if scale_request_id is None:
         print(
@@ -402,6 +538,7 @@ def _wait_for_scale_request(
         return
 
     # Poll the resize request to completion
+    last_desc = ""
     while True:
         time.sleep(poll_interval_seconds)
         try:
@@ -411,15 +548,13 @@ def _wait_for_scale_request(
             continue
         data = resp.get("data") or {}
         status = str(data.get("status") or data.get("Status") or "UNKNOWN").upper()
-        pct = data.get("progressPercent") if data.get("progressPercent") is not None else data.get("ProgressPercent")
-        msg = data.get("progressDescription") or data.get("ProgressDescription") or ""
+        pct = data.get("progressPercent") if data.get("progressPercent") is not None else data.get("ProgressPercent", 0)
+        desc = data.get("progressDescription") or data.get("ProgressDescription") or ""
 
-        parts = [f"Request {scale_request_id}", f"status={status}"]
-        if msg:
-            parts.append(msg)
-        if pct is not None:
-            parts.append(f"{pct}%")
-        print(" ".join(parts))
+        elapsed = _fmt_elapsed(time.monotonic() - poll_start)
+        line = f"  [{elapsed}] [{status}] {pct}%" + (f" — {desc}" if desc != last_desc else "")
+        print(line, flush=True)
+        last_desc = desc
 
         if status in ("COMPLETED", "DONE", "SUCCEEDED"):
             return
@@ -1024,35 +1159,40 @@ def _print_cluster_status_box(
     title_name = _cluster_name_value(inner) or (configured_name or "-")
     title = f"Cluster {title_name} ({cluster_id})"
 
-    lines = _cluster_summary_lines(ref, str(cluster_id), inner)
+    summary_lines = _cluster_summary_lines(ref, str(cluster_id), inner)
 
     try:
         dcs_resp = api.get_cluster_dcs(account_id, cluster_id, enriched=True)
         dcs = _extract_datacenter_items(dcs_resp)
     except APIError as exc:
         dcs = []
-        lines.append(f"datacenters: unavailable ({exc})")
+        summary_lines.append(f"datacenters: unavailable ({exc})")
 
     if dcs:
-        lines.append("")
-        lines.append("datacenters:")
+        summary_lines.append("")
+        summary_lines.append("datacenters:")
         for dc in dcs:
             dc_name = _dc_name_value(dc)
             dc_status = _status_badge(_dc_status_value(dc))
             nodes = _extract_node_items(dc)
-            lines.append(f"- {dc_name} ({dc_status}), nodes={len(nodes)}")
+            summary_lines.append(f"- {dc_name} ({dc_status}), nodes={len(nodes)}")
 
     try:
         nodes_resp = api.get_cluster_nodes(account_id, cluster_id, enriched=True)
         nodes = _extract_cluster_node_items(nodes_resp)
     except APIError as exc:
         nodes = []
-        lines.append("")
-        lines.append(f"nodes: unavailable ({exc})")
+        summary_lines.append(f"\nnodes: unavailable ({exc})")
 
+    # ---- Print header ----------------------------------------------------------
+    print(f"  {title}")
+    print("  " + "─" * len(title))
+    for line in summary_lines:
+        print(f"  {line}")
+
+    # ---- Print node table at natural width -------------------------------------
     if nodes:
-        lines.append("")
-        lines.append("node details:")
+        print()
         headers = [
             "Private IP",
             "Status",
@@ -1081,15 +1221,22 @@ def _print_cluster_status_box(
                 ]
             )
         rows.sort(key=lambda r: (r[4], r[0]))
-        lines.extend(_render_table(headers, rows))
-
-    _status_box(title, lines)
+        for line in _render_table(headers, rows):
+            print(line)
 
 
 def cmd_setup(args: argparse.Namespace) -> None:
     config_path = resolve_config_path(args.config, allow_missing=True)
     conf = load_config(config_path)
     cluster_ref, cluster = _cluster_from_sources(conf, args)
+
+    api_allow_create = conf.get("api", {}).get("allow_create", False)
+    if not cluster.get("allow_create", api_allow_create):
+        _die(
+            f"Cluster '{cluster_ref}': creation is not permitted. "
+            "Set 'allow_create: true' under the 'api:' section (applies to all clusters) "
+            "to permit cluster creation."
+        )
 
     if cluster.get("existing_cluster_id"):
         print(
@@ -1127,6 +1274,8 @@ def cmd_setup(args: argparse.Namespace) -> None:
     _print_json("Create response:", resp)
 
     request_id = _extract_request_id(resp)
+    if request_id is not None:
+        _record_request(config_path, request_id, cluster_ref, None, "setup")
     cluster_name_target = payload.get("clusterName")
     
     final = None
@@ -1171,7 +1320,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
 def cmd_resize(args: argparse.Namespace) -> None:
     config_path = resolve_config_path(args.config, allow_missing=True)
     conf = load_config(config_path)
-    _, cluster = _cluster_from_sources(conf, args)
+    cluster_ref, cluster = _cluster_from_sources(conf, args)
 
     token, timeout, ssl_verify = _api_settings(conf, args)
     cloud_data_path, err_path = _paths(conf, config_path, args)
@@ -1221,6 +1370,8 @@ def cmd_resize(args: argparse.Namespace) -> None:
     _print_json("Resize response:", resp)
 
     request_id = _extract_request_id(resp)
+    if request_id is not None:
+        _record_request(config_path, request_id, cluster_ref, cluster_id, "resize")
     cluster_name = str(cluster.get("cluster_name") or cluster_id)
 
     if args.wait and request_id is not None:
@@ -1262,11 +1413,27 @@ def cmd_destroy(args: argparse.Namespace) -> None:
     conf = load_config(config_path)
     cluster_ref, cluster = _cluster_from_sources(conf, args)
 
+    api_allow_destroy = conf.get("api", {}).get("allow_destroy", False)
+    if not cluster.get("allow_destroy", api_allow_destroy):
+        _die(
+            f"Cluster '{cluster_ref}': destruction is not permitted. "
+            "Set 'allow_destroy: true' under the 'api:' section (applies to all clusters) "
+            "or under the specific cluster to permit deletion."
+        )
+
     # Prompt for confirmation if --yes not provided
     if not args.yes and not args.dry_run:
         cluster_name = str(cluster.get("cluster_name") or "").strip()
         if not _confirm(f"Are you sure you want to destroy cluster '{cluster_name}'?"):
             print("Destroy cancelled.")
+            return
+        # Second factor: require the user to type the cluster name exactly
+        try:
+            typed = input(f"Type the cluster name to confirm: ").strip()
+        except EOFError:
+            typed = ""
+        if typed != cluster_name:
+            print(f"Name mismatch (expected '{cluster_name}'). Destroy cancelled.")
             return
 
     token, timeout, ssl_verify = _api_settings(conf, args)
@@ -1289,13 +1456,14 @@ def cmd_destroy(args: argparse.Namespace) -> None:
     resp = api.delete_cluster(account_id, cluster_id, cluster_name)
     _decode_and_maybe_fail(resp, catalog)
     _print_json("Destroy response:", resp)
-    print(f"\n⏳ Waiting for cluster '{cluster_name}' to be destroyed...")
-    print(f"✓ Cluster '{cluster_name}' destroyed!")
 
     request_id = _extract_request_id(resp)
-    if args.wait and request_id is not None:
-        final = _wait_for_request(api, account_id, request_id, args.wait_timeout, args.poll_interval)
-        _print_json("Final request status:", final)
+    if request_id is not None:
+        _record_request(config_path, request_id, cluster_ref, cluster_id, "destroy")
+        print(f"\nDestroy submitted (requestId={request_id}).")
+        print(f"  Track deletion: ptx progress {cluster_ref} --follow")
+    else:
+        print(f"\nDestroy request submitted.")
 
     if config_path is not None and cluster_ref in (conf.get("clusters") or {}):
         try:
@@ -1426,6 +1594,384 @@ def _extract_placeholder_node_groups(cluster_config: dict[str, Any]) -> list[tup
     return groups
 
 
+# ---------------------------------------------------------------------------
+# Helpers for cmd_sync
+# ---------------------------------------------------------------------------
+
+def _normalize_cloud(raw: str | None) -> str | None:
+    """Map API cloud provider names to config values 'aws' or 'gcp'."""
+    if not raw:
+        return None
+    lower = raw.lower()
+    if "amazon" in lower or lower == "aws":
+        return "aws"
+    if "google" in lower or lower == "gcp":
+        return "gcp"
+    return raw.lower()
+
+
+def _normalize_cluster_type(raw: str | None) -> str | None:
+    """Map API clusterType values to config values 'x-cloud' or 'scylla-cloud'."""
+    if not raw:
+        return None
+    lower = raw.lower().replace("_", "-")
+    if "xcloud" in lower or lower == "x-cloud":
+        return "x-cloud"
+    if "scylla" in lower or "standard" in lower:
+        return "scylla-cloud"
+    return lower
+
+
+def _extract_region_name(raw: Any) -> str | None:
+    """Return a region external ID string from whatever the enriched API sends."""
+    if not raw:
+        return None
+    if isinstance(raw, dict):
+        return (
+            raw.get("externalId")
+            or raw.get("fullName")
+            or raw.get("name")
+        )
+    return str(raw)
+
+
+def cmd_sync(args: argparse.Namespace) -> None:
+    """Populate a sparse cluster config entry from live API data."""
+    config_path = resolve_config_path(args.config, allow_missing=True)
+    conf = load_config(config_path)
+    cluster_ref, cluster = _cluster_from_sources(conf, args)
+
+    cluster_id = cluster.get("existing_cluster_id")
+    if not cluster_id:
+        _die(f"Cluster '{cluster_ref}' has no existing_cluster_id — nothing to sync from")
+    cluster_id = int(cluster_id)
+
+    token, timeout, ssl_verify = _api_settings(conf, args)
+    api = ScyllaCloudAPI(token=token, timeout=timeout, ssl_verify=ssl_verify)
+    account_id = _account_id(api)
+
+    resp = api.get_cluster(account_id, cluster_id, enriched=True)
+    raw = resp.get("data") or {}
+    # X-Cloud wraps cluster details under data["cluster"]
+    inner = raw.get("cluster") or raw
+
+    # ---- Determine cluster type ------------------------------------------------
+    # Prefer scalingMode field (present on all enriched clusters) over clusterType
+    scaling_mode = str(inner.get("scalingMode") or "").lower()
+    if scaling_mode == "xcloud":
+        cluster_type = "x-cloud"
+    else:
+        cluster_type = _normalize_cluster_type(
+            inner.get("clusterType") or inner.get("type")
+        ) or "scylla-cloud"
+
+    # ---- Build field map -------------------------------------------------------
+    fields: dict[str, Any] = {}
+
+    name = _cluster_name_value(inner)
+    if name:
+        fields["cluster_name"] = name
+
+    fields["cluster_type"] = cluster_type
+
+    # Cloud provider
+    cloud_raw = (
+        (inner.get("cloudProvider") or {}).get("name")
+        or inner.get("cloudProviderFullName")
+        or inner.get("cloud")
+    )
+    cloud = _normalize_cloud(cloud_raw)
+    if cloud:
+        fields["cloud"] = cloud
+
+    # Region — prefer externalId from enriched dict
+    region = _extract_region_name(
+        inner.get("regionName") or inner.get("region")
+    )
+    if region:
+        fields["region"] = region
+
+    # ScyllaDB version
+    version_raw = inner.get("scyllaVersion") or inner.get("version")
+    version = (
+        version_raw.get("version") or version_raw.get("versionId")
+        if isinstance(version_raw, dict)
+        else version_raw
+    )
+    if version:
+        fields["scylla_version"] = str(version)
+
+    # API interface
+    iface = inner.get("userApiInterface") or inner.get("apiInterface")
+    if iface:
+        fields["api_interface"] = str(iface).upper()
+
+    # Network
+    bcast = inner.get("broadcastType")
+    if bcast:
+        fields["broadcast_type"] = str(bcast).upper()
+
+    # CIDR — cluster level, then embedded dc dict, then dataCenters list, then vpcList
+    cidr = inner.get("cidrBlock") or inner.get("networkAddress")
+    if not cidr:
+        embedded_dc = inner.get("dc") or {}
+        cidr = embedded_dc.get("cidrBlock")
+    if not cidr:
+        dcs_inline = inner.get("dataCenters") or []
+        if dcs_inline:
+            cidr = (dcs_inline[0] or {}).get("cidrBlock")
+    if not cidr:
+        vpc_list = inner.get("vpcList") or []
+        if vpc_list:
+            cidr = (vpc_list[0] or {}).get("cidrBlock")
+    if cidr:
+        fields["cidr_block"] = str(cidr)
+
+    rf = inner.get("replicationFactor") or inner.get("replication_factor")
+    if rf:
+        fields["replication_factor"] = int(rf)
+
+    # ---- Type-specific fields --------------------------------------------------
+    if cluster_type == "scylla-cloud":
+        # Derive node_groups from embedded instance + nodes list
+        instance = inner.get("instance") or {}
+        node_type = instance.get("externalId") or instance.get("name")
+        nodes = inner.get("nodes") or []
+        node_count = len(nodes) if nodes else None
+        if not node_count:
+            node_count = int(rf) if rf else None
+
+        # DC name as group name (fall back to "primary")
+        embedded_dc = inner.get("dc") or (inner.get("dataCenters") or [{}])[0]
+        grp_name = embedded_dc.get("name") or "primary"
+
+        if node_type or node_count:
+            entry: dict[str, Any] = {"name": grp_name}
+            if node_type:
+                entry["node_type"] = str(node_type)
+            if node_count:
+                entry["count"] = int(node_count)
+            fields["node_groups"] = [entry]
+
+    elif cluster_type == "x-cloud":
+        # Fetch DC scaling policy
+        try:
+            dcs_resp = api.get_cluster_dcs(account_id, cluster_id, enriched=True)
+            dcs_data = dcs_resp.get("data") or {}
+            dcs = (
+                dcs_data.get("dataCenters")
+                or dcs_data.get("datacenters")
+                or (dcs_data if isinstance(dcs_data, list) else [])
+            )
+            if not dcs:
+                # Fall back to inline dataCenters in cluster response
+                dcs = inner.get("dataCenters") or []
+            if dcs and isinstance(dcs, list):
+                dc = dcs[0]
+                sp = dc.get("scaling") or dc.get("scalingPolicy") or {}
+                policies = sp.get("policies") or {}
+                storage_p = policies.get("storage") or {}
+                vcpu_p = policies.get("vcpu") or {}
+
+                scaling: dict[str, Any] = {}
+
+                raw_families = sp.get("instanceFamilies") or dc.get("instanceFamilies")
+                if raw_families:
+                    scaling["instance_families"] = list(raw_families)
+
+                stor: dict[str, Any] = {}
+                min_gb = storage_p.get("min")
+                if min_gb is not None:
+                    stor["min_gb"] = int(min_gb)
+                target_util = storage_p.get("targetUtilization")
+                if target_util is not None:
+                    tv = float(target_util)
+                    # API stores as fraction (0.8); config uses percent (80)
+                    stor["target_utilization"] = int(round(tv * 100)) if tv <= 1.0 else int(tv)
+                if stor:
+                    scaling["storage"] = stor
+
+                vcpu_min = vcpu_p.get("min")
+                if vcpu_min is not None:
+                    scaling["vcpu"] = {"min": int(vcpu_min)}
+
+                if scaling:
+                    fields["scaling"] = scaling
+        except APIError as exc:
+            print(f"Warning: could not fetch DC scaling policy: {exc}")
+
+    # ---- Write back ------------------------------------------------------------
+    if not fields:
+        print(f"No fields discovered for '{cluster_ref}' (cluster {cluster_id}) — nothing written.")
+        return
+
+    if config_path is None:
+        print("No config file found — cannot write back. Discovered fields:")
+        for k, v in fields.items():
+            print(f"  {k}: {v}")
+        return
+
+    write_back_cluster_fields(config_path, cluster_ref, fields)
+
+    print(f"Synced '{cluster_ref}' (cluster {cluster_id}) — {len(fields)} field(s) written:")
+    for k, v in fields.items():
+        print(f"  {k}: {v}")
+
+
+def cmd_progress(args: argparse.Namespace) -> None:
+    config_path = resolve_config_path(args.config, allow_missing=True)
+    conf = load_config(config_path)
+    cluster_ref, cluster = _cluster_from_sources(conf, args)
+
+    token, timeout, ssl_verify = _api_settings(conf, args)
+    api = ScyllaCloudAPI(token=token, timeout=timeout, ssl_verify=ssl_verify)
+    account_id = _account_id(api)
+    cluster_id = _cluster_numeric_id(cluster)
+
+    active_request_id: int | None = None
+    req_type: str = ""
+    active_status: str = ""
+    active_req_data: dict[str, Any] = {}
+    elapsed_offset: float = 0.0
+
+    # --- Step 1: use local cache to find the request WE submitted ---
+    # This avoids picking up stale requests whose API status hasn't updated yet.
+    cache_data = _load_request_cache(_request_cache_path(config_path))
+    best_cached: tuple[int, datetime, str] | None = None
+    for rid_str, entry in (cache_data.get("requests") or {}).items():
+        if entry.get("cluster_ref") != cluster_ref:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(entry["submitted_at"]).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if best_cached is None or ts > best_cached[1]:
+            best_cached = (int(rid_str), ts, entry.get("operation", ""))
+
+    if best_cached is not None:
+        cached_rid, cached_ts, _ = best_cached
+        try:
+            resp = api.get_cluster_request(account_id, cached_rid)
+            rd = resp.get("data") or {}
+            st = str(rd.get("status") or rd.get("Status") or "").upper()
+            rt = str(rd.get("requestType") or rd.get("RequestType") or "")
+            pct = rd.get("progressPercent") or rd.get("ProgressPercent") or 0
+            if _is_active_request_status(st) and pct != 100:
+                active_request_id = cached_rid
+                req_type = rt
+                active_status = st
+                active_req_data = rd
+                elapsed_offset = max(0.0, (datetime.now(timezone.utc) - cached_ts).total_seconds())
+        except APIError:
+            pass
+
+    # --- Step 2: cached request already done — scan for follow-on RESIZE_CLUSTER_* ---
+    # Also the fallback when no cache entry exists.
+    if active_request_id is None:
+        try:
+            reqs = api.list_cluster_requests(account_id, cluster_id)
+        except APIError as exc:
+            _die(f"Could not fetch cluster requests: {exc}")
+        for r in reqs:
+            st = str(r.get("status") or r.get("Status") or "").upper()
+            rt = str(r.get("requestType") or r.get("RequestType") or "")
+            pct = r.get("progressPercent") or r.get("ProgressPercent") or 0
+            # Skip requests stuck at 100% with stale status (API hasn't caught up)
+            if pct == 100:
+                continue
+            if _is_active_request_status(st) and rt.startswith("RESIZE_CLUSTER"):
+                rid = r.get("id") or r.get("ID")
+                try:
+                    full = (api.get_cluster_request(account_id, rid)).get("data") or {}
+                    r = {**r, **full}
+                except APIError:
+                    pass
+                active_request_id = rid
+                req_type = rt
+                active_status = st
+                active_req_data = r
+                # Use cache time of the original trigger as total elapsed if available
+                if best_cached is not None:
+                    elapsed_offset = max(0.0, (datetime.now(timezone.utc) - best_cached[1]).total_seconds())
+                    # Record this RESIZE_CLUSTER_* in the cache using the original
+                    # trigger's submitted_at so total elapsed is from `ptx resize`.
+                    # Add 1ms so it sorts after the trigger and becomes best_cached.
+                    resize_submitted_at = best_cached[1] + timedelta(milliseconds=1)
+                    _record_request(config_path, rid, cluster_ref, cluster_id, req_type, submitted_at=resize_submitted_at)
+                else:
+                    elapsed_offset = _request_elapsed_offset(r)
+                break
+
+    if active_request_id is None:
+        # No active request — show the last known state from cache instead of a bare message
+        if best_cached is not None:
+            cached_rid, cached_ts, _ = best_cached
+            try:
+                resp = api.get_cluster_request(account_id, cached_rid)
+                rd = resp.get("data") or {}
+                st = str(rd.get("status") or rd.get("Status") or "UNKNOWN").upper()
+                rt = str(rd.get("requestType") or rd.get("RequestType") or "")
+                pct = rd.get("progressPercent") or rd.get("ProgressPercent") or 0
+                desc = rd.get("progressDescription") or rd.get("ProgressDescription") or ""
+                # Use completed_at recorded in the cache for a stable duration.
+                # If not yet stamped (first time seeing it as completed), stamp it now.
+                if st not in ("FAILED", "ERROR", "CANCELED", "CANCELLED"):
+                    _record_request_completed(config_path, cached_rid)
+                cache_entry = (_load_request_cache(_request_cache_path(config_path)).get("requests") or {}).get(str(cached_rid)) or {}
+                completed_at_str = cache_entry.get("completed_at")
+                if completed_at_str:
+                    try:
+                        completed_at = datetime.fromisoformat(completed_at_str.replace("Z", "+00:00"))
+                        duration = max(0.0, (completed_at - cached_ts).total_seconds())
+                    except Exception:
+                        duration = 0.0
+                else:
+                    duration = 0.0
+                total = _fmt_elapsed(duration)
+                type_label = f" [{rt}]" if rt else ""
+                print(f"Last request {cached_rid}{type_label} [{st}] on cluster '{cluster_ref}' — completed in ~{total}")
+                line = f"  [{total}] [{st}] {pct}%" + (f" — {desc}" if desc else "")
+                print(line)
+                return
+            except APIError:
+                pass
+        print(f"No active request found for cluster '{cluster_ref}' (id=={cluster_id}).")
+        return
+
+    elapsed_so_far = _fmt_elapsed(elapsed_offset)
+    type_label = f" [{req_type}]" if req_type else ""
+    print(f"Active request {active_request_id}{type_label} [{active_status}] on cluster '{cluster_ref}' (id={cluster_id}) — {elapsed_so_far} elapsed")
+
+    if not args.wait:
+        pct = active_req_data.get("progressPercent") or active_req_data.get("ProgressPercent") or 0
+        desc = active_req_data.get("progressDescription") or active_req_data.get("ProgressDescription") or ""
+        line = f"  [{elapsed_so_far}] [{active_status}] {pct}%" + (f" — {desc}" if desc else "")
+        # If it's already complete in the snapshot, stamp completed_at
+        if active_status in ("COMPLETED", "DONE", "SUCCEEDED"):
+            _record_request_completed(config_path, active_request_id)
+        print(line)
+        return
+
+    # --wait: poll the active request to completion
+    try:
+        _wait_for_request(api, account_id, active_request_id, args.wait_timeout, args.poll_interval, elapsed_offset=elapsed_offset)
+        _record_request_completed(config_path, active_request_id)
+    except KeyboardInterrupt:
+        print(f"\nDetached from polling. Operation continues in the background.")
+        print(f"  Resume with: ptx progress {cluster_ref} --follow")
+        return
+
+    # If the completed request was a trigger type (e.g. UPDATE_DC_SCALING), a
+    # RESIZE_CLUSTER_* is spawned asynchronously afterwards — follow it too.
+    if not req_type.startswith("RESIZE_CLUSTER"):
+        print("Watching for resize operation to begin...")
+        try:
+            _wait_for_scale_request(api, account_id, cluster_id, args.poll_interval)
+        except KeyboardInterrupt:
+            print(f"\nDetached from polling. Operation continues in the background.")
+            print(f"  Resume with: ptx progress {cluster_ref} --follow")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     config_path = resolve_config_path(args.config, allow_missing=True)
     conf = load_config(config_path)
@@ -1544,7 +2090,55 @@ def cmd_list(args: argparse.Namespace) -> None:
     api = ScyllaCloudAPI(token=token, timeout=timeout, ssl_verify=ssl_verify)
     account_id = _account_id(api)
     resp = api.list_clusters(account_id, enriched=True)
-    _print_json("Cloud clusters:", resp)
+
+    if getattr(args, "json", False):
+        _print_json("Cloud clusters:", resp)
+        return
+
+    clusters = _extract_cluster_items(resp)
+    if not clusters:
+        print("(no clusters found)")
+        return
+
+    headers = ["ID", "Name", "Status", "Cloud / Region", "DCs", "Nodes", "Created"]
+    rows: list[list[str]] = []
+    for c in clusters:
+        cid = str(c.get("id") or c.get("clusterId") or "-")
+        name = _cluster_name_value(c) or "-"
+        status = _status_badge(_cluster_status_value(c))
+        cloud_region = _cloud_env_value(c)
+        dcs = c.get("dataCenters") or c.get("datacenters") or []
+        dc_count = len(dcs) if isinstance(dcs, list) else 0
+        # Sum replicationFactor across DCs — the list endpoint does not inline nodes,
+        # but RF equals node count per DC for standard clusters and is the RF target for X-Cloud.
+        # Fall back to the embedded single-dc object if dataCenters is empty.
+        node_count = 0
+        if isinstance(dcs, list) and dcs:
+            for dc in dcs:
+                if isinstance(dc, dict):
+                    rf = dc.get("replicationFactor") or dc.get("replication_factor") or 0
+                    inline = _extract_node_items(dc)
+                    node_count += len(inline) if inline else int(rf)
+        if node_count == 0:
+            embedded_dc = c.get("dc") or {}
+            rf = embedded_dc.get("replicationFactor") or embedded_dc.get("replication_factor") or 0
+            node_count = int(rf) * max(dc_count, 1) if rf else 0
+        created = _parse_ts(c, "createdAt", "created_at", "CreatedAt")
+        if created is None:
+            # createdAt is absent from the list endpoint — fetch from the single-cluster endpoint
+            cid_int = c.get("id") or c.get("clusterId")
+            if cid_int is not None:
+                try:
+                    detail_resp = api.get_cluster(account_id, int(cid_int), enriched=False)
+                    detail = (detail_resp.get("data") or {}).get("cluster") or (detail_resp.get("data") or {})
+                    created = _parse_ts(detail, "createdAt", "created_at", "CreatedAt")
+                except APIError:
+                    pass
+        created_str = created.strftime("%Y-%m-%d") if created else "-"
+        rows.append([cid, name, status, cloud_region, str(dc_count), str(node_count), created_str])
+
+    for line in _render_table(headers, rows):
+        print(line)
 
 
 def cmd_validate(args: argparse.Namespace) -> None:
@@ -1727,7 +2321,7 @@ def _add_cluster_override_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_wait_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--wait", dest="wait", action="store_true", default=True, help="Wait for async request completion (default)")
-    parser.add_argument("--no-wait", dest="wait", action="store_false", help="Skip waiting for completion")
+    parser.add_argument("--no-wait", "--nowait", dest="wait", action="store_false", help="Skip waiting for completion")
     parser.add_argument("--wait-timeout", type=int, default=3600, help="Max wait time in seconds")
     parser.add_argument("--poll-interval", type=int, default=20, help="Polling interval in seconds")
 
@@ -1756,10 +2350,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_destroy = sub.add_parser("destroy", help="Destroy a cluster")
     _add_cluster_override_args(p_destroy)
     _add_common_runtime_args(p_destroy)
-    _add_wait_args(p_destroy)
     p_destroy.add_argument("--yes", action="store_true", help="Confirm destructive action")
     p_destroy.add_argument("--dry-run", action="store_true", help="Show target without API call")
     p_destroy.set_defaults(func=cmd_destroy)
+
+    p_progress = sub.add_parser("progress", help="Show or follow active request progress for a cluster")
+    _add_cluster_override_args(p_progress)
+    _add_common_runtime_args(p_progress)
+    p_progress.add_argument("--wait", "--follow", "-f", action="store_true", help="Poll until the request completes (default: one-shot snapshot)")
+    p_progress.add_argument("--wait-timeout", type=int, default=3600, help="Max wait time in seconds (used with --wait)")
+    p_progress.add_argument("--poll-interval", type=int, default=20, help="Polling interval in seconds (used with --wait)")
+    p_progress.set_defaults(func=cmd_progress)
+
+    p_sync = sub.add_parser("sync", help="Populate cluster config from live API data (requires existing_cluster_id)")
+    _add_cluster_override_args(p_sync)
+    _add_common_runtime_args(p_sync)
+    p_sync.set_defaults(func=cmd_sync)
 
     p_status = sub.add_parser("status", help="Show cluster status")
     _add_cluster_override_args(p_status)
@@ -1768,6 +2374,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_list = sub.add_parser("list", help="List all account clusters")
     _add_common_runtime_args(p_list)
+    p_list.add_argument("--json", action="store_true", help="Emit raw JSON instead of table")
     p_list.set_defaults(func=cmd_list)
 
     p_cache = sub.add_parser("cache-refresh-cloud", help="Refresh cloud-data.json from Scylla Cloud deployment API")
@@ -1802,6 +2409,9 @@ def main() -> None:
         args.func(args)
     except (ConfigError, MappingError, APIError) as exc:
         _die(str(exc))
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
 
 
 if __name__ == "__main__":

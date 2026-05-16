@@ -11,6 +11,8 @@ api:
   ssl_verify: true                               # Verify SSL certificates
   ssh_key_public: "~/.ssh/id_ed25519.pub"       # Global public SSH key path
   ssh_key_private: "~/.ssh/id_ed25519"          # Global private SSH key path
+  allow_create: false                            # Safety guard: set to true to allow 'ptx setup' to create any cluster
+  allow_destroy: false                           # Safety guard: set to true to allow 'ptx destroy' on any cluster (can be overridden per cluster)
 
 # Reference Data (friendly values -> Scylla Cloud IDs)
 reference_data:
@@ -28,6 +30,10 @@ clusters:
     description: "Production X-Cloud cluster on AWS"
     cluster_type: "x-cloud"                      # x-cloud | scylla-cloud
     
+    # Safety guards — both default to false; must be explicitly enabled to allow destructive operations
+    allow_create: false                          # Set to true to allow 'ptx setup' to create this cluster
+    allow_destroy: false                         # Set to true to allow 'ptx destroy' to delete this cluster (overrides api-level)
+
     # Link to existing cluster (optional) — if set, skip creation and attach to existing cluster
     existing_cluster_id: null                    # Set to cluster-id to manage existing cluster
     
@@ -75,7 +81,10 @@ clusters:
     cluster_name: "prod-sc-gcp"
     description: "Standard Scylla Cloud cluster on GCP"
     cluster_type: "scylla-cloud"                 # Standard Scylla Cloud
-    
+
+    allow_create: false                          # Set to true to allow 'ptx setup' to create this cluster
+    allow_destroy: false                         # Set to true to allow 'ptx destroy' to delete this cluster
+
     existing_cluster_id: null
     
     cloud: "gcp"
@@ -107,7 +116,10 @@ clusters:
     cluster_name: "existing-xc"
     description: "Manage an existing X-Cloud cluster"
     cluster_type: "x-cloud"
-    
+
+    allow_create: false                          # Set to true to allow 'ptx setup' to create this cluster
+    allow_destroy: false                         # Set to true to allow 'ptx destroy' to delete this cluster
+
     # Link to existing — this tells the API to manage, not create
     existing_cluster_id: "xxxxx-xxxxx-xxxxx"    # REQUIRED to manage without creating
     
@@ -135,7 +147,10 @@ clusters:
     cluster_name: "existing-sc"
     description: "Resize an existing Scylla Cloud cluster"
     cluster_type: "scylla-cloud"
-    
+
+    allow_create: false                          # Set to true to allow 'ptx setup' to create this cluster
+    allow_destroy: false                         # Set to true to allow 'ptx destroy' to delete this cluster
+
     existing_cluster_id: "yyyyy-yyyyy-yyyyy"
     
     cloud: "aws"

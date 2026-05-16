@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 proteus = "ptx.cli:main"
+px = "ptx.cli:main"
 ptx = "ptx.cli:main"
 
 [tool.setuptools]

@@ -1,0 +1,43 @@
+{
+  "_version": 1,
+  "requests": {
+    "242571": {
+      "submitted_at": "2026-05-16T10:32:57.586994+00:00",
+      "cluster_ref": "x1",
+      "cluster_id": 49505,
+      "operation": "resize",
+      "completed_at": "2026-05-16T10:51:17.695315+00:00"
+    },
+    "242573": {
+      "submitted_at": "2026-05-16T10:52:53.078364+00:00",
+      "cluster_ref": "x1",
+      "cluster_id": 49505,
+      "operation": "resize"
+    },
+    "242574": {
+      "submitted_at": "2026-05-16T11:01:05.402030+00:00",
+      "cluster_ref": "x1",
+      "cluster_id": 49505,
+      "operation": "destroy"
+    },
+    "242585": {
+      "submitted_at": "2026-05-16T14:18:37.604933+00:00",
+      "cluster_ref": "sc1",
+      "cluster_id": null,
+      "operation": "setup"
+    },
+    "242595": {
+      "submitted_at": "2026-05-16T14:45:35.998643+00:00",
+      "cluster_ref": "sc2",
+      "cluster_id": 49508,
+      "operation": "resize",
+      "completed_at": "2026-05-16T14:55:48.584971+00:00"
+    },
+    "242596": {
+      "submitted_at": "2026-05-16T14:47:19.406045+00:00",
+      "cluster_ref": "sc1",
+      "cluster_id": 49507,
+      "operation": "destroy"
+    }
+  }
+}
