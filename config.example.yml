@@ -11,8 +11,8 @@ api:
   ssl_verify: true                               # Verify SSL certificates
   ssh_key_public: "~/.ssh/id_ed25519.pub"       # Global public SSH key path
   ssh_key_private: "~/.ssh/id_ed25519"          # Global private SSH key path
-  allow_create: false                            # Safety guard: set to true to allow 'ptx setup' to create any cluster
-  allow_destroy: false                           # Safety guard: set to true to allow 'ptx destroy' on any cluster (can be overridden per cluster)
+  allow_create: false                            # Safety guard: set to true to allow 'px setup' to create any cluster
+  allow_destroy: false                           # Safety guard: set to true to allow 'px destroy' on any cluster (can be overridden per cluster)
 
 # Reference Data (friendly values -> Scylla Cloud IDs)
 reference_data:
@@ -25,14 +25,14 @@ clusters:
   # ─────────────────────────────────────────────────────────────────────────────
   # Example 1: New X-Cloud cluster on AWS
   # ─────────────────────────────────────────────────────────────────────────────
-  prod-xc-aws:
+  c1:
     cluster_name: "prod-xc-aws"                  # Cluster display name (max 63 chars, lowercase, hyphens ok)
     description: "Production X-Cloud cluster on AWS"
     cluster_type: "x-cloud"                      # x-cloud | scylla-cloud
     
     # Safety guards — both default to false; must be explicitly enabled to allow destructive operations
-    allow_create: false                          # Set to true to allow 'ptx setup' to create this cluster
-    allow_destroy: false                         # Set to true to allow 'ptx destroy' to delete this cluster (overrides api-level)
+    allow_create: false                          # Set to true to allow 'px setup' to create this cluster
+    allow_destroy: false                         # Set to true to allow 'px destroy' to delete this cluster (overrides api-level)
 
     # Link to existing cluster (optional) — if set, skip creation and attach to existing cluster
     existing_cluster_id: null                    # Set to cluster-id to manage existing cluster
@@ -77,13 +77,13 @@ clusters:
   # ─────────────────────────────────────────────────────────────────────────────
   # Example 2: New standard Scylla Cloud cluster on GCP
   # ─────────────────────────────────────────────────────────────────────────────
-  prod-sc-gcp:
+  c2:
     cluster_name: "prod-sc-gcp"
     description: "Standard Scylla Cloud cluster on GCP"
     cluster_type: "scylla-cloud"                 # Standard Scylla Cloud
 
-    allow_create: false                          # Set to true to allow 'ptx setup' to create this cluster
-    allow_destroy: false                         # Set to true to allow 'ptx destroy' to delete this cluster
+    allow_create: false                          # Set to true to allow 'px setup' to create this cluster
+    allow_destroy: false                         # Set to true to allow 'px destroy' to delete this cluster
 
     existing_cluster_id: null
     
@@ -110,107 +110,7 @@ clusters:
         count: 3                                 # Node count in group
     
   # ─────────────────────────────────────────────────────────────────────────────
-  # Example 3: Existing X-Cloud cluster (management only)
+  # Example 4: Existing Scylla Cloud / X Cloud
   # ─────────────────────────────────────────────────────────────────────────────
-  existing-xc:
-    cluster_name: "existing-xc"
-    description: "Manage an existing X-Cloud cluster"
-    cluster_type: "x-cloud"
-
-    allow_create: false                          # Set to true to allow 'ptx setup' to create this cluster
-    allow_destroy: false                         # Set to true to allow 'ptx destroy' to delete this cluster
-
-    # Link to existing — this tells the API to manage, not create
-    existing_cluster_id: "xxxxx-xxxxx-xxxxx"    # REQUIRED to manage without creating
-    
-    cloud: "aws"
-    region: "us-east-1"
-    resolved_ids:
-      cloud_provider_id: null
-      region_id: null
-    
-    # For resize operations, update scaling policy
-    scaling:
-      instance_families:
-        - "i4i"
-        - "i8g"
-      storage:
-        min_gb: 512
-        target_utilization: 75
-      vcpu:
-        min: 8
-
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Example 4: Existing standard Scylla Cloud (resize node groups)
-  # ─────────────────────────────────────────────────────────────────────────────
-  existing-sc:
-    cluster_name: "existing-sc"
-    description: "Resize an existing Scylla Cloud cluster"
-    cluster_type: "scylla-cloud"
-
-    allow_create: false                          # Set to true to allow 'ptx setup' to create this cluster
-    allow_destroy: false                         # Set to true to allow 'ptx destroy' to delete this cluster
-
-    existing_cluster_id: "yyyyy-yyyyy-yyyyy"
-    
-    cloud: "aws"
-    region: "us-west-2"
-    resolved_ids:
-      cloud_provider_id: null
-      region_id: null
-    
-    # Update node groups (resize existing or add new)
-    node_groups:
-      - name: "primary"
-        node_type: "i8g.4xlarge"                 # Change instance type
-        count: 5                                 # Scale from 3 to 5
-      - name: "secondary"                        # New node group
-        node_type: "i4i.xlarge"
-        count: 2
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Lifecycle Operations Configuration
-# ─────────────────────────────────────────────────────────────────────────────
-
-operations:
-  # Timeouts for various operations
-  create_timeout_seconds: 3600                   # Max time to wait for cluster creation
-  resize_timeout_seconds: 1800                   # Max time to wait for resize to complete
-  delete_timeout_seconds: 900                    # Max time to wait for deletion
-  
-  # Polling interval while waiting for operations to complete
-  poll_interval_seconds: 30
-  
-  # Auto-tagging
-  tags:
-    environment: "production"                    # Add tags to created resources
-    managed_by: "scylla-cloud-api"
-    # project: "my-project"                      # Optional custom tags
-
-  # API error handling helpers
-  error_handling:
-    decode_with_catalog: true                    # Translate API codes (e.g. 040703) using api_error_codes.tsv
-    fail_on_unknown_code: false                  # If true, unknown codes are treated as hard failures
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Advanced Settings (Optional)
-# ─────────────────────────────────────────────────────────────────────────────
-
-advanced:
-  # Backup/snapshot settings
-  backup:
-    enabled: true                                # Enable automated backups
-    retention_days: 7                            # Backup retention period
-  
-  # Multi-region settings (future support)
-  multi_region:
-    enabled: false
-    # regions:
-    #   - us-east-1
-    #   - eu-west-1
-  
-  # Monitoring & alerting hooks
-  webhooks:
-    enabled: false
-    # on_cluster_ready: "https://example.com/webhook/ready"
-    # on_resize_complete: "https://example.com/webhook/resize"
+  c3:
+    existing_cluster_id: "scylla-cloud-cluster-id"   # REQUIRED to manage without creating `px sync c3` can be used to import cluster details into the config file
