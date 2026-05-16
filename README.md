@@ -27,8 +27,8 @@ px destroy x1                    # submit deletion, detach immediately
 - **Scylla Cloud Node Groups** — Resize named node groups independently
 - **Two-Phase Resize Polling** — Tracks policy update → auto-scaler handoff for X-Cloud
 - **Live Status Table** — SAF-style `[✔]`/`[✘]`/`[◑]` symbols across all configured clusters
-- **Request Progress Tracking** — `px progress <cluster>` shows elapsed time, %, and description for any in-flight or recently completed request; `--follow`/`-f` tails it live
-- **Local Request Cache** — `.px_requests.json` alongside config stores submitted/completed timestamps for accurate elapsed display across sessions
+- **Request Progress Tracking** — `px progress <cluster>` shows elapsed time, %, and description for any in-flight request; shows status for recently completed ones; `--follow`/`-f` tails it live
+- **Local Request Cache** — `.px_requests.json` alongside config tracks `submitted_at`, `last_seen_active_at`, and `completed_at` (stamped on first 100% poll observation) for accurate tracking across sessions
 - **SAF-Style Poll Output** — `[1m23s] [IN_PROGRESS] 67% — Rebalancing data` with deduped descriptions
 - **`px list`** — Live account-wide cluster table with status, cloud/region, node count, and created date
 - **Detach-by-Default Destroy** — `px destroy` returns immediately after submission; track deletion via `px progress`
@@ -333,7 +333,8 @@ Proteus first checks the local request cache (`.px_requests.json`) for the most 
 ```
 
 - Elapsed is computed from the locally cached `submitted_at` timestamp — accurate even across sessions.
-- When no active request exists, shows the last completed request with a stable `completed_at − submitted_at` duration.
+- `completed_at` is stamped the first time a poll observes `100%`, keeping the completion time accurate regardless of whether `--follow` was used.
+- When no active request exists, shows the last known status without a duration (the API provides no server-side timestamps).
 
 ```bash
 px progress x1                  # snapshot: current status + elapsed
