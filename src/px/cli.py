@@ -2344,7 +2344,7 @@ def _add_cluster_override_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--instance-type-ids", help="Comma list of instance IDs")
     parser.add_argument("--storage-min-gb", type=int, help="X-cloud storage policy min in GB")
     parser.add_argument("--storage-target-utilization", type=float, help="X-cloud storage target utilization (80 or 0.8)")
-    parser.add_argument("--vcpu-min", type=int, help="X-cloud vCPU policy minimum")
+    parser.add_argument("--vcpu-min", "--vcpu", dest="vcpu_min", type=int, help="X-cloud vCPU policy minimum")
 
     parser.add_argument("--wanted-size", "--wantedsize", dest="wanted_size", help="Shortcut override for desired instance size")
     parser.add_argument("--wanted-count", "--wantedcount", dest="wanted_count", type=int, help="Shortcut override for desired node count")

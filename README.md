@@ -140,15 +140,8 @@ clusters:
     cidr_block: 172.31.1.0/24
     node_groups:
       - name: primary
-        node_type: i8g.4xlarge
+        node_type: n2-highmem-8
         count: 3
-
-advanced:
-  backup:
-    enabled: true
-    retention_days: 7
-  multi_region:
-    enabled: false
 ```
 
 ---
@@ -267,9 +260,9 @@ px resize x1 --dry-run
 px resize x1 --no-wait
 
 # Override X-Cloud scaling policy values at the CLI without editing config
-px resize x1 --vcpu-min 12 --storage-target-utilization 75
-px resize x1 --vcpu-min 24 
-px resize x1 --vcpu-min 24 --instance-families i4i 
+px resize x1 --vcpu 12 --storage-target-utilization 75
+px resize x1 --vcpu 24 
+px resize x1 --vcpu 24 --instance-families i4i 
 px resize x1 --instance-families i7i
 
 # Scylla Cloud: resize node group (count and/or instance type)
