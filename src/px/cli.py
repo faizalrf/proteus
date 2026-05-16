@@ -449,6 +449,16 @@ def _record_request_completed(config_path: Path | None, request_id: int) -> None
         _save_request_cache(cache_path, data)
 
 
+def _update_cache_entry(config_path: Path | None, request_id: int, fields: dict[str, Any]) -> None:
+    """Update arbitrary fields on an existing cache entry. No-op if entry not found."""
+    cache_path = _request_cache_path(config_path)
+    data = _load_request_cache(cache_path)
+    entry = (data.get("requests") or {}).get(str(request_id))
+    if entry is not None:
+        entry.update(fields)
+        _save_request_cache(cache_path, data)
+
+
 def _get_cached_submitted_at(config_path: Path | None, request_id: int) -> datetime | None:
     cache_path = _request_cache_path(config_path)
     entry = (_load_request_cache(cache_path).get("requests") or {}).get(str(request_id))
@@ -467,6 +477,7 @@ def _wait_for_request(
     timeout_seconds: int,
     poll_interval_seconds: int,
     elapsed_offset: float = 0.0,
+    config_path: Path | None = None,
 ) -> dict[str, Any]:
     start = time.monotonic() - elapsed_offset
     deadline = start + timeout_seconds
@@ -479,9 +490,22 @@ def _wait_for_request(
         desc = data.get("progressDescription") or data.get("ProgressDescription") or ""
 
         elapsed = _fmt_elapsed(time.monotonic() - start)
-        line = f"  [{elapsed}] [{status}] {pct}%" + (f" — {desc}" if desc != last_desc else "")
+        if status in ("COMPLETED", "DONE", "SUCCEEDED"):
+            line = f"  [{status}] {pct}%" + (f" — {desc}" if desc != last_desc else "")
+        else:
+            line = f"  [{elapsed}] [{status}] {pct}%" + (f" — {desc}" if desc != last_desc else "")
         print(line, flush=True)
         last_desc = desc
+
+        # Keep cache up to date: stamp completed_at on first 100% observation;
+        # otherwise update last_seen_active_at so we know when it was last active.
+        if config_path is not None:
+            if pct == 100 or status in ("COMPLETED", "DONE", "SUCCEEDED"):
+                _record_request_completed(config_path, request_id)
+            else:
+                _update_cache_entry(config_path, request_id, {
+                    "last_seen_active_at": datetime.now(timezone.utc).isoformat(),
+                })
 
         if status in ("COMPLETED", "DONE", "SUCCEEDED"):
             return resp
@@ -500,6 +524,7 @@ def _wait_for_scale_request(
     cluster_id: int,
     poll_interval_seconds: int,
     trigger_timeout: int = 120,
+    config_path: Path | None = None,
 ) -> None:
     """Phase 2: wait for Scylla Cloud to start a RESIZE_CLUSTER_* request and poll it to completion."""
     poll_start = time.monotonic()
@@ -552,9 +577,20 @@ def _wait_for_scale_request(
         desc = data.get("progressDescription") or data.get("ProgressDescription") or ""
 
         elapsed = _fmt_elapsed(time.monotonic() - poll_start)
-        line = f"  [{elapsed}] [{status}] {pct}%" + (f" — {desc}" if desc != last_desc else "")
+        if status in ("COMPLETED", "DONE", "SUCCEEDED"):
+            line = f"  [{status}] {pct}%" + (f" — {desc}" if desc != last_desc else "")
+        else:
+            line = f"  [{elapsed}] [{status}] {pct}%" + (f" — {desc}" if desc != last_desc else "")
         print(line, flush=True)
         last_desc = desc
+
+        if config_path is not None:
+            if pct == 100 or status in ("COMPLETED", "DONE", "SUCCEEDED"):
+                _record_request_completed(config_path, scale_request_id)
+            else:
+                _update_cache_entry(config_path, scale_request_id, {
+                    "last_seen_active_at": datetime.now(timezone.utc).isoformat(),
+                })
 
         if status in ("COMPLETED", "DONE", "SUCCEEDED"):
             return
@@ -1281,7 +1317,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
     final = None
     if args.wait and request_id is not None:
         print(f"\n⏳ Waiting for cluster '{cluster_name_target}' to be ready...")
-        final = _wait_for_request(api, account_id, request_id, args.wait_timeout, args.poll_interval)
+        final = _wait_for_request(api, account_id, request_id, args.wait_timeout, args.poll_interval, config_path=config_path)
         print(f"✓ Cluster '{cluster_name_target}' is ready!")
 
     candidate_id = _extract_cluster_id_from_payload(final)
@@ -1378,10 +1414,10 @@ def cmd_resize(args: argparse.Namespace) -> None:
         if mode == "x-cloud":
             # Phase 1: wait for the policy update request to complete
             print(f"\n⏳ Applying scaling policy for '{cluster_name}'...")
-            _wait_for_request(api, account_id, request_id, args.wait_timeout, args.poll_interval)
+            _wait_for_request(api, account_id, request_id, args.wait_timeout, args.poll_interval, config_path=config_path)
             print(f"✓ Scaling policy saved.")
             # Phase 2: watch for the auto-scaler to start a RESIZE_CLUSTER_* request
-            _wait_for_scale_request(api, account_id, cluster_id, args.poll_interval)
+            _wait_for_scale_request(api, account_id, cluster_id, args.poll_interval, config_path=config_path)
             print(f"✓ Cluster '{cluster_name}' scaling complete!")
         else:
             print(f"\n⏳ Waiting for cluster '{cluster_name}' resize to complete...")
@@ -1927,10 +1963,9 @@ def cmd_progress(args: argparse.Namespace) -> None:
                         duration = 0.0
                 else:
                     duration = 0.0
-                total = _fmt_elapsed(duration)
                 type_label = f" [{rt}]" if rt else ""
-                print(f"Last request {cached_rid}{type_label} [{st}] on cluster '{cluster_ref}' — completed in ~{total}")
-                line = f"  [{total}] [{st}] {pct}%" + (f" — {desc}" if desc else "")
+                print(f"Last request {cached_rid}{type_label} [{st}] on cluster '{cluster_ref}'")
+                line = f"  [{st}] {pct}%" + (f" — {desc}" if desc else "")
                 print(line)
                 return
             except APIError:
@@ -1954,8 +1989,7 @@ def cmd_progress(args: argparse.Namespace) -> None:
 
     # --wait: poll the active request to completion
     try:
-        _wait_for_request(api, account_id, active_request_id, args.wait_timeout, args.poll_interval, elapsed_offset=elapsed_offset)
-        _record_request_completed(config_path, active_request_id)
+        _wait_for_request(api, account_id, active_request_id, args.wait_timeout, args.poll_interval, elapsed_offset=elapsed_offset, config_path=config_path)
     except KeyboardInterrupt:
         print(f"\nDetached from polling. Operation continues in the background.")
         print(f"  Resume with: ptx progress {cluster_ref} --follow")
@@ -1966,7 +2000,7 @@ def cmd_progress(args: argparse.Namespace) -> None:
     if not req_type.startswith("RESIZE_CLUSTER"):
         print("Watching for resize operation to begin...")
         try:
-            _wait_for_scale_request(api, account_id, cluster_id, args.poll_interval)
+            _wait_for_scale_request(api, account_id, cluster_id, args.poll_interval, config_path=config_path)
         except KeyboardInterrupt:
             print(f"\nDetached from polling. Operation continues in the background.")
             print(f"  Resume with: ptx progress {cluster_ref} --follow")

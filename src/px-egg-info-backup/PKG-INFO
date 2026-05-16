@@ -1,3 +1,14 @@
+Metadata-Version: 2.4
+Name: proteus
+Version: 0.1.0
+Summary: Proteus — SAF-style CLI for managing Scylla Cloud and X-Cloud clusters
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: requests>=2.31.0
+Dynamic: license-file
+
 # Proteus
 
 ![Proteus](images/proteus.png)
@@ -593,9 +604,9 @@ px cloud-data --cloud aws --region us-west-2   # inspect local map
 
 ```
 proteus/
-├── src/px/
+├── src/ptx/
 │   ├── __init__.py
-│   ├── __main__.py     # `python -m px` entrypoint
+│   ├── __main__.py     # `python -m ptx` entrypoint (internal package stays named ptx)
 │   ├── api.py          # Scylla Cloud REST API client
 │   ├── cli.py          # All subcommands and rendering logic
 │   ├── config.py       # YAML config loading and path resolution

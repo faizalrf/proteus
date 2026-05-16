@@ -38,6 +38,20 @@
       "cluster_ref": "sc1",
       "cluster_id": 49507,
       "operation": "destroy"
+    },
+    "242598": {
+      "submitted_at": "2026-05-16T15:38:33.446044+00:00",
+      "cluster_ref": "sc2",
+      "cluster_id": 49508,
+      "operation": "resize",
+      "last_seen_active_at": "2026-05-16T15:38:53.992155+00:00"
+    },
+    "242599": {
+      "submitted_at": "2026-05-16T15:38:33.447044+00:00",
+      "cluster_ref": "sc2",
+      "cluster_id": 49508,
+      "operation": "RESIZE_CLUSTER_V3",
+      "last_seen_active_at": "2026-05-16T15:41:55.692931+00:00"
     }
   }
 }

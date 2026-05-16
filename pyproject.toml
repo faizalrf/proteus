@@ -14,9 +14,9 @@ dependencies = [
 ]
 
 [project.scripts]
-proteus = "ptx.cli:main"
-px = "ptx.cli:main"
-ptx = "ptx.cli:main"
+proteus = "px.cli:main"
+px = "px.cli:main"
+ptx = "px.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
